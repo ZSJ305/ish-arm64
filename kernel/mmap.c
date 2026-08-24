@@ -11,6 +11,29 @@
 
 #if ANON_MMAP_LIMIT_PAGES > 0
 _Atomic long anon_page_count;
+
+// [T-ish-anon-cap-above-jetsam] Announce the moment the cap actually bites.
+//
+// Without this the guest just sees ENOMEM and the app log says nothing, so a
+// runaway allocation is indistinguishable from a bug in the user's script —
+// which is exactly how the 2026-08-24 report was first misread. Rate-limited
+// because a process hitting the ceiling typically retries in a tight loop.
+static void anon_limit_report(const char *where, long requested_pages) {
+    static _Atomic long last_report_pages;
+    long count = atomic_load(&anon_page_count);
+    long prev = atomic_load(&last_report_pages);
+    // One line per 16MB of movement in the high-water mark, so a retry storm
+    // does not itself become the thing that floods the log.
+    if (count > prev - 4096 && count < prev + 4096)
+        return;
+    atomic_store(&last_report_pages, count);
+    printk("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB), "
+           "requested %ld pages (%ld MB), cap %d pages (%d MB). "
+           "Returning ENOMEM to the guest instead of letting the host app be "
+           "killed by jetsam.\n",
+           where, count, count / 256, requested_pages, requested_pages / 256,
+           ANON_MMAP_LIMIT_PAGES, ANON_MMAP_LIMIT_PAGES / 256);
+}
 #endif
 
 struct mm *mm_new() {
@@ -170,8 +193,10 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
         }
 #endif
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (!is_prot_none && atomic_load(&anon_page_count) + (long)pages > ANON_MMAP_LIMIT_PAGES)
+        if (!is_prot_none && atomic_load(&anon_page_count) + (long)pages > ANON_MMAP_LIMIT_PAGES) {
+            anon_limit_report("mmap", (long)pages);
             return _ENOMEM;
+        }
         if (!is_prot_none)
             atomic_fetch_add(&anon_page_count, (long)pages);
 #endif
@@ -564,8 +589,10 @@ addr_t sys_brk(addr_t new_brk) {
         if (!pt_is_hole(&mm->mem, start, size))
             goto out;
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (atomic_load(&anon_page_count) + (long)size > ANON_MMAP_LIMIT_PAGES)
+        if (atomic_load(&anon_page_count) + (long)size > ANON_MMAP_LIMIT_PAGES) {
+            anon_limit_report("brk", (long)size);
             goto out;
+        }
         atomic_fetch_add(&anon_page_count, (long)size);
 #endif
         int err = pt_map_nothing(&mm->mem, start, size, P_WRITE);

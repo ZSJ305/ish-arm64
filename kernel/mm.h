@@ -8,9 +8,25 @@
 // Maximum anonymous mmap pages across ALL processes (host memory cap).
 // Prevents iOS app from being killed by jetsam.
 // 0 = no limit. Non-zero = hard limit in pages (4KB each).
-// Go runtime alone needs ~1.1GB for page summary reservations (PROT_NONE).
+// Go runtime alone needs ~1.1GB for page summary reservations (PROT_NONE),
+// which do NOT count here — the mmap path exempts PROT_NONE explicitly.
 // 524288 pages = 2GB.
-#define ANON_MMAP_LIMIT_PAGES 1048576
+//
+// [T-ish-anon-cap-above-jetsam] Keep this BELOW the iOS jetsam threshold, or
+// the whole mechanism is decorative. 5d8e1e1a raised it 2GB → 4GB for Node,
+// which put it above the point where iOS kills the app: a runaway guest
+// allocation now reached jetsam before ever reaching the cap, so the guest
+// never got the ENOMEM that would have failed one command, and the user lost
+// the entire app instead. Observed 2026-08-24: a guest compile grew the app
+// footprint ~40MB/s from 135MB to 3.36GB over ~100s and was SIGKILLed, twice,
+// with anon_page_count still far under 1048576.
+//
+// Node does not actually need 4GB: exec.c injects --max-old-space-size=512,
+// so V8's heap is bounded at 512MB regardless of what this allows.
+//
+// 2GB is the pre-5d8e1e1a value and leaves headroom under jetsam on the
+// smallest supported device while staying far above any legitimate workload.
+#define ANON_MMAP_LIMIT_PAGES 524288
 
 #if ANON_MMAP_LIMIT_PAGES > 0
 extern _Atomic long anon_page_count;
