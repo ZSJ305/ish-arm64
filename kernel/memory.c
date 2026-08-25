@@ -640,6 +640,13 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
     return 0;
 }
 
+// [T-ish-cluster-hitrate] Every anonymous host allocation, and the guest pages
+// it backs, regardless of which path asked for it. Without this the cluster
+// hit rate is unanchored: a high hit rate means nothing if most memory is
+// actually arriving through mmap/brk instead.
+_Atomic uint64_t st_anon_mmaps;        // host mmap calls for anonymous memory
+_Atomic uint64_t st_anon_pages_mapped; // guest pages they backed
+
 int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     if (pages == 0) return 0;
     // Use host PROT_NONE for guest PROT_NONE mappings. Go runtime reserves
@@ -652,6 +659,13 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
     void *memory = mmap(NULL, map_size, host_prot, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (memory == MAP_FAILED)
         return _ENOMEM;
+    if (host_prot != PROT_NONE) {
+        // PROT_NONE reservations cost no physical memory, so they would only
+        // dilute the ratio we are trying to measure.
+        atomic_fetch_add_explicit(&st_anon_mmaps, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&st_anon_pages_mapped, (uint64_t)pages,
+                                  memory_order_relaxed);
+    }
     return pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
 }
 
@@ -689,6 +703,21 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
 // replaces. Anonymous-page accounting deliberately stays in GUEST pages: the
 // cap must stay correct in the worst case where every commit degrades to a
 // single page, so it is charged per guest page here just as before.
+// [T-ish-cluster-hitrate] Diagnostic counters. A workload whose real benefit
+// is far below the 4x the design predicts must be measurable, not guessed at:
+// these separate "did the cluster fire" from the specific reason it did not,
+// because a mapped neighbour (the guest is filling a region we already backed
+// — benign, the memory is shared anyway) and a foreign/absent reservation (the
+// cluster is genuinely unavailable) call for completely different responses.
+_Atomic uint64_t st_cluster_full;        // committed the whole host page
+_Atomic uint64_t st_cluster_single;      // degraded to one guest page
+_Atomic uint64_t st_cluster_why_mapped;  // ...because a neighbour was mapped
+_Atomic uint64_t st_cluster_why_flags;   // ...because same_flags refused
+_Atomic uint64_t st_cluster_why_nocluster; // ...host page == guest page
+_Atomic uint64_t st_cluster_why_enomem;  // ...cluster mmap failed, retried
+_Atomic uint64_t st_cluster_pages_committed; // guest pages actually committed
+_Atomic uint64_t st_cluster_calls;       // total calls
+
 int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
                    bool (*same_flags)(struct mem *mem, page_t page, void *ctx),
                    void *ctx, pages_t *committed_out) {
@@ -696,13 +725,21 @@ int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
     if (cluster_pages < 1)
         cluster_pages = 1;
 
+    atomic_fetch_add_explicit(&st_cluster_calls, 1, memory_order_relaxed);
+
     page_t base = page & ~(page_t)(cluster_pages - 1);
     bool whole_cluster = cluster_pages > 1;
+    if (!whole_cluster)
+        atomic_fetch_add_explicit(&st_cluster_why_nocluster, 1, memory_order_relaxed);
 
     if (whole_cluster) {
         for (page_t p = base; p < base + cluster_pages; p++) {
-            if (mem_pt(mem, p) != NULL) { whole_cluster = false; break; }
+            if (mem_pt(mem, p) != NULL) {
+                atomic_fetch_add_explicit(&st_cluster_why_mapped, 1, memory_order_relaxed);
+                whole_cluster = false; break;
+            }
             if (same_flags != NULL && !same_flags(mem, p, ctx)) {
+                atomic_fetch_add_explicit(&st_cluster_why_flags, 1, memory_order_relaxed);
                 whole_cluster = false; break;
             }
         }
@@ -715,6 +752,8 @@ int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
         // Retry as a single page: the cluster may have failed only because the
         // larger host allocation didn't fit.
         if (whole_cluster) {
+            atomic_fetch_add_explicit(&st_cluster_why_enomem, 1, memory_order_relaxed);
+            whole_cluster = false;
             err = pt_map_nothing(mem, page, 1, flags);
             count = 1;
         }
@@ -723,8 +762,34 @@ int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
             return err;
         }
     }
+    if (count > 1)
+        atomic_fetch_add_explicit(&st_cluster_full, 1, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&st_cluster_single, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&st_cluster_pages_committed, (uint64_t)count,
+                              memory_order_relaxed);
     if (committed_out) *committed_out = count;
     return 0;
+}
+
+// Snapshot the cluster-commit counters for host-side diagnostics.
+void ish_anon_mmap_stats(uint64_t *mmaps, uint64_t *pages) {
+    if (mmaps) *mmaps = atomic_load(&st_anon_mmaps);
+    if (pages) *pages = atomic_load(&st_anon_pages_mapped);
+}
+
+void ish_cluster_stats(uint64_t *calls, uint64_t *full, uint64_t *single,
+                       uint64_t *why_mapped, uint64_t *why_flags,
+                       uint64_t *why_nocluster, uint64_t *why_enomem,
+                       uint64_t *pages_committed) {
+    if (calls) *calls = atomic_load(&st_cluster_calls);
+    if (full) *full = atomic_load(&st_cluster_full);
+    if (single) *single = atomic_load(&st_cluster_single);
+    if (why_mapped) *why_mapped = atomic_load(&st_cluster_why_mapped);
+    if (why_flags) *why_flags = atomic_load(&st_cluster_why_flags);
+    if (why_nocluster) *why_nocluster = atomic_load(&st_cluster_why_nocluster);
+    if (why_enomem) *why_enomem = atomic_load(&st_cluster_why_enomem);
+    if (pages_committed) *pages_committed = atomic_load(&st_cluster_pages_committed);
 }
 
 // Cluster predicate for the reservation lazy-commit path: a neighbour may be
