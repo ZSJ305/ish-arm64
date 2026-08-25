@@ -174,6 +174,17 @@ int pt_map_nothing(struct mem *mem, page_t page, pages_t pages, unsigned flags);
 int pt_unmap(struct mem *mem, page_t start, pages_t pages);
 // like pt_unmap but doesn't care if part of the range isn't mapped
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages);
+
+// [T-ish-cluster-commit] Commit the faulting page as part of an aligned,
+// host-page-sized cluster so a 4KB guest page doesn't consume a whole 16KB
+// host page. Degrades to a single-page commit whenever the cluster's other
+// pages are already mapped or `same_flags` rejects them; on a 4KB-page host
+// it is exactly pt_map_nothing(page, 1). Reports how many pages were actually
+// committed via `committed_out` (NULL if not needed) so callers can keep
+// anonymous-page accounting exact. Caller must hold mem->lock for WRITING.
+int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
+                   bool (*same_flags)(struct mem *mem, page_t page, void *ctx),
+                   void *ctx, pages_t *committed_out);
 // Set the flags on memory
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags);
 // Copy pages from src memory to dst memory using copy-on-write

@@ -655,6 +655,86 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
     return pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
 }
 
+// [T-ish-cluster-commit] Commit a single faulting guest page as part of a
+// host-page-sized CLUSTER, to stop 4KB guest pages each burning a whole 16KB
+// host page.
+//
+// Every committed page gets its own host mmap, and Darwin on Apple Silicon
+// cannot hand back less than 16KB, so a one-page commit wastes 12KB. Measured
+// on the 2026-08-25 jsonnet compile: 116,836 VM_ALLOCATE regions, every one
+// exactly 16KB, holding 456MB of guest pages while consuming 1826MB of host
+// memory — a 4x amplification.
+//
+// The cluster machinery already exists: pt_map() points N guest pages at one
+// host allocation and refcounts it, and pt_unmap() only munmaps when the last
+// page of that allocation goes away. That IS the per-cluster occupancy map the
+// naive "one mmap per page" callers were bypassing by passing pages=1.
+//
+// Correctness over packing (never fabricate a cluster):
+//   * The cluster is the aligned run of `real_page_size / PAGE_SIZE` guest
+//     pages containing `page` — always contiguous and aligned by construction,
+//     never assembled from scattered requests.
+//   * Every page in it must currently be unmapped. A mapped neighbour means
+//     the region is already backed; silently re-mapping it would strand the
+//     old allocation and corrupt the address space.
+//   * `same_flags` lets the caller require that neighbours belong to the same
+//     logical region (e.g. one reservation) before they are committed early.
+//   * Anything unmet degrades to the plain single-page commit. Wasting 12KB is
+//     always preferable to mapping a page the guest did not ask for.
+//
+// On a 4KB-page host (x86 sim, Linux) cluster_pages == 1 and this is exactly
+// the old behaviour.
+//
+// Caller must hold mem->lock for writing — same as the pt_map_nothing call it
+// replaces. Anonymous-page accounting deliberately stays in GUEST pages: the
+// cap must stay correct in the worst case where every commit degrades to a
+// single page, so it is charged per guest page here just as before.
+int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
+                   bool (*same_flags)(struct mem *mem, page_t page, void *ctx),
+                   void *ctx, pages_t *committed_out) {
+    pages_t cluster_pages = (pages_t)(real_page_size >> PAGE_BITS);
+    if (cluster_pages < 1)
+        cluster_pages = 1;
+
+    page_t base = page & ~(page_t)(cluster_pages - 1);
+    bool whole_cluster = cluster_pages > 1;
+
+    if (whole_cluster) {
+        for (page_t p = base; p < base + cluster_pages; p++) {
+            if (mem_pt(mem, p) != NULL) { whole_cluster = false; break; }
+            if (same_flags != NULL && !same_flags(mem, p, ctx)) {
+                whole_cluster = false; break;
+            }
+        }
+    }
+
+    page_t start = whole_cluster ? base : page;
+    pages_t count = whole_cluster ? cluster_pages : 1;
+    int err = pt_map_nothing(mem, start, count, flags);
+    if (err < 0) {
+        // Retry as a single page: the cluster may have failed only because the
+        // larger host allocation didn't fit.
+        if (whole_cluster) {
+            err = pt_map_nothing(mem, page, 1, flags);
+            count = 1;
+        }
+        if (err < 0) {
+            if (committed_out) *committed_out = 0;
+            return err;
+        }
+    }
+    if (committed_out) *committed_out = count;
+    return 0;
+}
+
+// Cluster predicate for the reservation lazy-commit path: a neighbour may be
+// pulled in only if it belongs to the SAME reservation. Committing a page from
+// a different reservation (or none) would hand the guest memory it never
+// reserved, with flags taken from the wrong region.
+static bool reservation_cluster_ok(struct mem *mem, page_t page, void *ctx) {
+    return mem_find_reservation(mem, page) == (struct mem_reservation *) ctx;
+}
+
 // W^X stat: stores that hit a P_CODE page and unprotected it (see mem_ptr).
 _Atomic uint64_t st_wx_clears = 0;
 
@@ -934,7 +1014,25 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
                 atomic_fetch_add(&anon_page_count, 1);
             }
 #endif
-            pt_map_nothing(mem, grow_start, grow_count, P_WRITE | P_GROWSDOWN);
+            // [T-ish-cluster-commit] A multi-page window is already one host
+            // allocation shared by refcount, so it needs no clustering. Only
+            // the degraded single-page case (cap-shrunk, or a fault adjacent
+            // to mapped stack) would burn a whole host page for 4KB — route
+            // that one through the cluster helper. No same_flags predicate:
+            // every page here is stack in the same growsdown region, and the
+            // helper still refuses to touch already-mapped neighbours.
+            if (grow_count == 1) {
+                pages_t got = 0;
+                if (pt_map_cluster(mem, grow_start, P_WRITE | P_GROWSDOWN,
+                                   NULL, NULL, &got) >= 0 && got > 1) {
+#if ANON_MMAP_LIMIT_PAGES > 0
+                    // Charge the extra pages the cluster actually committed.
+                    atomic_fetch_add(&anon_page_count, (long)(got - 1));
+#endif
+                }
+            } else {
+                pt_map_nothing(mem, grow_start, grow_count, P_WRITE | P_GROWSDOWN);
+            }
         }
         write_wrunlock(&mem->lock);
         read_wrlock(&mem->lock);
@@ -968,19 +1066,43 @@ check_reservation: ;
             // the same thing Linux does when overcommitted memory can't be
             // backed. Roll the reservation back if the host mmap itself
             // fails, so a transient failure doesn't leak count forever.
+            // [T-ish-cluster-commit] Commit the whole host page at once when
+            // the neighbours are free and belong to this same reservation.
+            // This is the path that produced the 116k single-page regions.
+            unsigned commit_flags = res->flags & ~P_GROWSDOWN;
+            pages_t want = (pages_t)(real_page_size >> PAGE_BITS);
+            if (want < 1) want = 1;
 #if ANON_MMAP_LIMIT_PAGES > 0
             static _Atomic long reservation_denied_reported;
-            if (!anon_pages_reserve(1)) {
+            // Charge the cluster up front, then refund whatever wasn't
+            // committed. Charging after the fact could let two threads both
+            // pass a nearly-full cap and overshoot it.
+            pages_t charged = want;
+            if (!anon_pages_reserve(charged)) {
+                charged = 1;
+                if (!anon_pages_reserve(charged))
+                    charged = 0;
+            }
+            if (charged == 0) {
                 long prev = atomic_fetch_add(&reservation_denied_reported, 1);
                 if (prev % 4096 == 0)
                     printk("mem: anon page cap refused lazy commit for pid=%d "
                            "(page %#x, %ld denials so far) — guest gets SIGSEGV\n",
                            current != NULL ? current->pid : -1, page, prev + 1);
-            } else if (pt_map_nothing(mem, page, 1, res->flags & ~P_GROWSDOWN) < 0) {
-                anon_pages_unreserve(1);
+            } else {
+                pages_t got = 0;
+                int cerr = (charged == want)
+                    ? pt_map_cluster(mem, page, commit_flags,
+                                     reservation_cluster_ok, res, &got)
+                    : pt_map_nothing(mem, page, 1, commit_flags);
+                if (charged != want)
+                    got = (cerr < 0) ? 0 : 1;
+                if (got < charged)
+                    anon_pages_unreserve((long)(charged - got));
             }
 #else
-            pt_map_nothing(mem, page, 1, res->flags & ~P_GROWSDOWN);
+            pt_map_cluster(mem, page, commit_flags,
+                           reservation_cluster_ok, res, NULL);
 #endif
         }
         write_wrunlock(&mem->lock);
