@@ -60,12 +60,19 @@ static void anon_limit_report(const char *where, long requested_pages) {
         return;
     atomic_store(&last_report_pages, count);
     long limit = atomic_load(&anon_page_limit);
-    printk("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB), "
-           "requested %ld pages (%ld MB), cap %ld pages (%ld MB, ceiling %d MB). "
-           "Failing the guest allocation instead of letting the host app be "
-           "killed by jetsam.\n",
-           where, count, count / 256, requested_pages, requested_pages / 256,
-           limit, limit / 256, ANON_MMAP_LIMIT_PAGES / 256);
+    // [T-ish-anon-cap-page-units] Report HOST megabytes: each counted guest
+    // page occupies a full host page, so `pages / 256` (pages x 4KB) understates
+    // the real footprint by 4x on a 16KB-page device and made the previous log
+    // line agree with a cap that was itself wrong.
+    long kb_per_page = (long)getpagesize() / 1024;
+    printk("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB host), "
+           "requested %ld pages (%ld MB host), cap %ld pages (%ld MB host, "
+           "ceiling %ld MB host). Failing the guest allocation instead of "
+           "letting the host app be killed by jetsam.\n",
+           where, count, count * kb_per_page / 1024,
+           requested_pages, requested_pages * kb_per_page / 1024,
+           limit, limit * kb_per_page / 1024,
+           (long)ANON_MMAP_LIMIT_PAGES * kb_per_page / 1024);
 }
 #endif
 

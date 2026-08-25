@@ -6,12 +6,29 @@
 #include "kernel/memory.h"
 #include "misc.h"
 
-// Maximum anonymous mmap pages across ALL processes (host memory cap).
+// Maximum anonymous GUEST pages across ALL processes.
 // Prevents iOS app from being killed by jetsam.
-// 0 = no limit. Non-zero = hard limit in pages (4KB each).
+// 0 = no limit. Non-zero = hard limit in guest pages (4KB each).
 // Go runtime alone needs ~1.1GB for page summary reservations (PROT_NONE),
 // which do NOT count here — the mmap path exempts PROT_NONE explicitly.
-// 524288 pages = 2GB.
+//
+// [T-ish-anon-cap-page-units] BUDGET THE HOST, COUNT THE GUEST. This counter
+// is in 4KB guest pages, but what jetsam kills us over is HOST bytes, and on
+// arm64 iOS the host page is 16KB. Because every committed guest page takes a
+// whole host page (see the per-page pt_map_nothing paths), 1 counted page
+// costs 16KB of footprint, not 4KB. Converting a host-byte budget with the
+// guest page size therefore over-permits by exactly 4x.
+//
+// That is not hypothetical: the 2026-08-25 device test installed a nominal
+// "1953 MB" limit that actually authorised ~7.6GB of host memory, so the
+// runaway compile sailed from 102MB to 3361MB — jetsam-killed with the
+// counter at only ~42% of the limit and not one refusal logged. Confirmed in
+// the memgraph: 116,836 VM_ALLOCATE regions, every one exactly 16KB, holding
+// just 456MB worth of guest pages while consuming 1826MB of host memory.
+//
+// So: 131072 guest pages x 16KB host page = 2GB of actual host memory.
+// Anything converting bytes→pages for this counter must divide by the HOST
+// page size (getpagesize()), never by PAGE_SIZE.
 //
 // [T-ish-anon-cap-above-jetsam] Keep this BELOW the iOS jetsam threshold, or
 // the whole mechanism is decorative. 5d8e1e1a raised it 2GB → 4GB for Node,
@@ -25,8 +42,8 @@
 // Node does not actually need 4GB: exec.c injects --max-old-space-size=512,
 // so V8's heap is bounded at 512MB regardless of what this allows.
 //
-// 2GB is the pre-5d8e1e1a value and leaves headroom under jetsam on the
-// smallest supported device while staying far above any legitimate workload.
+// 2GB of host memory leaves headroom under jetsam on the smallest supported
+// device while staying far above any legitimate workload.
 //
 // [T-ish-anon-cap-dynamic] This constant is now the CEILING, not the limit.
 // A fixed number cannot sit on the right side of jetsam on every device: the
@@ -36,14 +53,15 @@
 // derives it from os_proc_available_memory() at kernel boot and installs it
 // via ish_set_anon_page_limit(), which clamps to at most this ceiling.
 // Builds whose host never calls the setter (tests, Linux) keep the ceiling.
-#define ANON_MMAP_LIMIT_PAGES 524288
+#define ANON_MMAP_LIMIT_PAGES 131072
 
 #if ANON_MMAP_LIMIT_PAGES > 0
 extern _Atomic long anon_page_count;
 // Effective limit in guest pages. Always in (0, ANON_MMAP_LIMIT_PAGES].
 extern _Atomic long anon_page_limit;
-// Install a host-derived limit (guest 4KB pages). Values ≤ 0 are ignored;
-// values above ANON_MMAP_LIMIT_PAGES are clamped to it.
+// Install a host-derived limit, in GUEST pages. Callers converting a host
+// byte budget must divide by the HOST page size — see the page-units note
+// above. Values ≤ 0 are ignored; values above the ceiling are clamped.
 void ish_set_anon_page_limit(long pages);
 // Check-and-add `pages` against anon_page_limit. Returns false (and adds
 // nothing) when the limit would be exceeded. All allocation sites that CAN
