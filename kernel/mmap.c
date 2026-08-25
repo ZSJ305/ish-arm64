@@ -17,6 +17,8 @@ _Atomic long anon_page_count;
 // fixed-cap behaviour.
 _Atomic long anon_page_limit = ANON_MMAP_LIMIT_PAGES;
 
+static void anon_count_check(long count);
+
 void ish_set_anon_page_limit(long pages) {
     if (pages <= 0)
         return; // host couldn't measure (e.g. unlimited) — keep the default
@@ -33,15 +35,66 @@ void ish_set_anon_page_limit(long pages) {
 bool anon_pages_reserve(long pages) {
     long limit = atomic_load(&anon_page_limit);
     long count = atomic_load(&anon_page_count);
+    anon_count_check(count);
     do {
         if (count + pages > limit)
             return false;
     } while (!atomic_compare_exchange_weak(&anon_page_count, &count, count + pages));
+    // Tell pt_map_nothing this much is already accounted for, so the pages it
+    // is about to map are not charged a second time.
+    anon_pages_precharged(pages);
     return true;
 }
 
 void anon_pages_unreserve(long pages) {
     atomic_fetch_sub(&anon_page_count, pages);
+}
+
+// [T-ish-anon-count-negative] Handoff between "reserved by a caller enforcing
+// the cap" and "charged because pages were actually mapped".
+//
+// pt_map_nothing charges every page it maps. Callers that reserve FIRST (to
+// refuse the allocation before doing any work) would otherwise be counted
+// twice, so they park the reservation here and pt_map_nothing consumes it.
+// Thread-local because the reserve and the map always happen on the same
+// thread, back to back, under mem->lock — a global would let two concurrent
+// mappers steal each other's credit.
+static __thread long anon_precharged_pages;
+
+void anon_pages_precharged(long pages) {
+    anon_precharged_pages = pages;
+}
+
+long anon_pages_precharge_peek(void) {
+    return anon_precharged_pages;
+}
+
+void anon_pages_charge_mapped(long pages) {
+    long credit = anon_precharged_pages;
+    anon_precharged_pages = 0;
+    if (credit >= pages)
+        return;              // fully covered by the caller's reservation
+    atomic_fetch_add(&anon_page_count, pages - credit);
+}
+
+// Fail loudly when the invariant breaks instead of silently granting memory.
+// Called from the cap check, which is the point where a negative count would
+// start handing out free headroom.
+static void anon_count_check(long count) {
+    if (count >= 0)
+        return;
+    static _Atomic bool reported;
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&reported, &expected, true)) {
+        printk("mmap: BUG anon_page_count went NEGATIVE (%ld pages) — "
+               "charge/uncharge asymmetry; the cap is now granting free "
+               "headroom. Clamping to 0.\n", count);
+        assert(count >= 0);
+    }
+    // Release builds (NDEBUG) keep running: clamp so the cap still holds a
+    // line rather than authorising unbounded memory.
+    long expected_count = count;
+    atomic_compare_exchange_strong(&anon_page_count, &expected_count, 0);
 }
 
 // [T-ish-anon-cap-above-jetsam] Announce the moment the cap actually bites.

@@ -68,6 +68,24 @@ void ish_set_anon_page_limit(long pages);
 // fail gracefully must go through this instead of a bare fetch_add.
 bool anon_pages_reserve(long pages);
 void anon_pages_unreserve(long pages);
+
+// [T-ish-anon-count-negative] Charge/uncharge must stay symmetric or the
+// counter drifts negative and the cap silently grants free headroom.
+//
+// The single source of truth for "does this mapping count": PROT_NONE
+// reservations occupy address space but no physical memory, so they are
+// neither charged when mapped nor decremented when unmapped. pt_map_nothing
+// and pt_unmap both gate on this — keep them agreeing.
+static inline bool anon_page_is_charged(unsigned flags) {
+    return (flags & (P_READ | P_WRITE | P_EXEC)) != 0;
+}
+// Charge `pages` that were actually mapped, minus anything the caller already
+// reserved via anon_pages_reserve(). Called by pt_map_nothing only.
+void anon_pages_charge_mapped(long pages);
+// Park a reservation for the mapping that immediately follows on this thread.
+void anon_pages_precharged(long pages);
+// Read the parked reservation without consuming it (retry paths).
+long anon_pages_precharge_peek(void);
 #endif
 
 // uses mem.lock instead of having a lock of its own
