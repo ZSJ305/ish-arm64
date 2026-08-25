@@ -923,7 +923,16 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
                 grow_end = grow_start + max_grow; // keep fault page, cap upward
             pages_t grow_count = grow_end - grow_start;
 #if ANON_MMAP_LIMIT_PAGES > 0
-            atomic_fetch_add(&anon_page_count, grow_count);
+            // [T-ish-anon-cap-dynamic] Respect the runtime cap for the
+            // 1MB pre-map window, but NEVER refuse the fault page itself —
+            // the block comment above explains that an unmapped fault page
+            // silently corrupts the frame. When the window doesn't fit,
+            // shrink to just the fault page and count it unconditionally:
+            // a 4KB overrun of the cap is noise, a corrupted stack is not.
+            if (!anon_pages_reserve((long)grow_count)) {
+                grow_count = 1;
+                atomic_fetch_add(&anon_page_count, 1);
+            }
 #endif
             pt_map_nothing(mem, grow_start, grow_count, P_WRITE | P_GROWSDOWN);
         }
@@ -949,10 +958,30 @@ check_reservation: ;
         write_wrlock(&mem->lock);
         entry = mem_pt(mem, page);
         if (entry == NULL) {
+            // [T-ish-anon-cap-dynamic] This lazy commit-on-fault is the path
+            // large NORESERVE reservations actually materialize through, one
+            // page per TLB miss — during the 2026-08-25 jsonnet compile it
+            // committed >116k pages while the old code only ever *counted*
+            // them, so the anon cap never applied and the footprint sailed
+            // past every limit. Enforce here too: on refusal leave the entry
+            // NULL, so mem_ptr returns NULL and the guest takes SIGSEGV —
+            // the same thing Linux does when overcommitted memory can't be
+            // backed. Roll the reservation back if the host mmap itself
+            // fails, so a transient failure doesn't leak count forever.
 #if ANON_MMAP_LIMIT_PAGES > 0
-            atomic_fetch_add(&anon_page_count, 1);
-#endif
+            static _Atomic long reservation_denied_reported;
+            if (!anon_pages_reserve(1)) {
+                long prev = atomic_fetch_add(&reservation_denied_reported, 1);
+                if (prev % 4096 == 0)
+                    printk("mem: anon page cap refused lazy commit for pid=%d "
+                           "(page %#x, %ld denials so far) — guest gets SIGSEGV\n",
+                           current != NULL ? current->pid : -1, page, prev + 1);
+            } else if (pt_map_nothing(mem, page, 1, res->flags & ~P_GROWSDOWN) < 0) {
+                anon_pages_unreserve(1);
+            }
+#else
             pt_map_nothing(mem, page, 1, res->flags & ~P_GROWSDOWN);
+#endif
         }
         write_wrunlock(&mem->lock);
         read_wrlock(&mem->lock);

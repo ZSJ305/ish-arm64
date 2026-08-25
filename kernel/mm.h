@@ -2,6 +2,7 @@
 #define KERNEL_MM_H
 
 #include <stdatomic.h>
+#include <stdbool.h>
 #include "kernel/memory.h"
 #include "misc.h"
 
@@ -26,10 +27,29 @@
 //
 // 2GB is the pre-5d8e1e1a value and leaves headroom under jetsam on the
 // smallest supported device while staying far above any legitimate workload.
+//
+// [T-ish-anon-cap-dynamic] This constant is now the CEILING, not the limit.
+// A fixed number cannot sit on the right side of jetsam on every device: the
+// threshold scales with RAM (iPhone 8 ≈ 1.4GB foreground vs iPhone 17 Pro
+// 6GB+), and 2GB is decorative on the former while over-conservative on the
+// latter. The effective limit lives in `anon_page_limit` below: the host
+// derives it from os_proc_available_memory() at kernel boot and installs it
+// via ish_set_anon_page_limit(), which clamps to at most this ceiling.
+// Builds whose host never calls the setter (tests, Linux) keep the ceiling.
 #define ANON_MMAP_LIMIT_PAGES 524288
 
 #if ANON_MMAP_LIMIT_PAGES > 0
 extern _Atomic long anon_page_count;
+// Effective limit in guest pages. Always in (0, ANON_MMAP_LIMIT_PAGES].
+extern _Atomic long anon_page_limit;
+// Install a host-derived limit (guest 4KB pages). Values ≤ 0 are ignored;
+// values above ANON_MMAP_LIMIT_PAGES are clamped to it.
+void ish_set_anon_page_limit(long pages);
+// Check-and-add `pages` against anon_page_limit. Returns false (and adds
+// nothing) when the limit would be exceeded. All allocation sites that CAN
+// fail gracefully must go through this instead of a bare fetch_add.
+bool anon_pages_reserve(long pages);
+void anon_pages_unreserve(long pages);
 #endif
 
 // uses mem.lock instead of having a lock of its own
