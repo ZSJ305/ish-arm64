@@ -885,7 +885,26 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                     page++;
                     run_len++;
                 }
+#if ANON_MMAP_LIMIT_PAGES > 0
+                // [T-ish-footprint-brake] This commit path used to be the ONE
+                // admission bypass: it charged the counter but never checked
+                // any limit, which is how V8's cage commits pushed the count
+                // to 160% of the cap and got every later tiny malloc refused
+                // instead of this one big ask. Route it through the same
+                // reserve gate as mmap/brk. Partial success (earlier runs in
+                // this same mprotect already committed) is acceptable —
+                // POSIX leaves mprotect's partial-failure state unspecified,
+                // and Linux itself can fail an mprotect midway.
+                if (!anon_pages_reserve((long)run_len))
+                    return _ENOMEM;
+                int merr = pt_map_nothing(mem, run_start, run_len, flags | P_ANONYMOUS);
+                if (merr < 0) {
+                    anon_pages_unreserve((long)run_len);
+                    return merr;
+                }
+#else
                 pt_map_nothing(mem, run_start, run_len, flags | P_ANONYMOUS);
+#endif
             }
 #endif
             continue;

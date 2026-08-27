@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 #include "debug.h"
 #include "kernel/calls.h"
@@ -27,12 +28,91 @@ void ish_set_anon_page_limit(long pages) {
     atomic_store(&anon_page_limit, pages);
 }
 
+// [T-ish-footprint-brake] Live memory status. stamp==0 means the host never
+// fed us — legacy ledger mode. See the design note in mm.h.
+static _Atomic int ish_mem_state_v = ISH_MEM_OK;
+static _Atomic uint64_t ish_mem_limit_v;
+static _Atomic uint64_t ish_mem_avail_v;
+static _Atomic uint64_t ish_mem_stamp_ms;
+
+// Feed staleness window. A sampler that stops updating for this long is
+// treated as dead and the brake engages — the governor must fail closed.
+#define ISH_MEM_STALE_MS 2000
+
+static uint64_t ish_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+bool ish_footprint_mode(void) {
+    return atomic_load(&ish_mem_stamp_ms) != 0;
+}
+
+void ish_set_memory_status(uint64_t limit_bytes, uint64_t avail_bytes, bool pressure_critical) {
+    if (limit_bytes == 0)
+        return; // host couldn't measure — don't flip modes on garbage
+    int prev = atomic_load(&ish_mem_state_v);
+    int next;
+    if (pressure_critical) {
+        // The OS itself says memory is critical — believe it over our math.
+        next = ISH_MEM_BRAKE;
+    } else if (avail_bytes * 10 < limit_bytes) {
+        next = ISH_MEM_BRAKE;                       // < 10% headroom
+    } else if (prev == ISH_MEM_BRAKE && avail_bytes * 100 < limit_bytes * 15) {
+        next = ISH_MEM_BRAKE;                       // hysteresis: exit above 15%
+    } else {
+        next = ISH_MEM_OK;
+    }
+    atomic_store(&ish_mem_limit_v, limit_bytes);
+    atomic_store(&ish_mem_avail_v, avail_bytes);
+    atomic_store(&ish_mem_state_v, next);
+    atomic_store(&ish_mem_stamp_ms, ish_monotonic_ms());
+    if (next != prev)
+        printk("mem: brake %s — footprint %lu MB / limit %lu MB (avail %lu MB)%s\n",
+               next == ISH_MEM_BRAKE ? "ENGAGED" : "released",
+               (unsigned long)((limit_bytes - avail_bytes) >> 20),
+               (unsigned long)(limit_bytes >> 20),
+               (unsigned long)(avail_bytes >> 20),
+               pressure_critical ? " [OS pressure critical]" : "");
+}
+
+bool ish_mem_commit_ok(uint64_t bytes) {
+    uint64_t stamp = atomic_load(&ish_mem_stamp_ms);
+    if (stamp == 0)
+        return true;   // legacy mode: the ledger check in anon_pages_reserve decides
+    uint64_t limit = atomic_load(&ish_mem_limit_v);
+    // Sanity gate: one request larger than the entire allowance can never be
+    // dirtied safely — give it a clean upfront ENOMEM (malloc returns NULL)
+    // instead of admitting it and killing the process mid-memset later.
+    if (limit != 0 && bytes > limit)
+        return false;
+    if (ish_monotonic_ms() - stamp > ISH_MEM_STALE_MS)
+        return false;  // dead sampler fails closed
+    return atomic_load(&ish_mem_state_v) == ISH_MEM_OK;
+}
+
 // Check-and-add under the runtime limit. CAS loop rather than fetch_add so a
 // refusal adds nothing — the old blind fetch_add sites both leaked count on
 // the failure path and (worse) let paths that "only account" sail past the
 // limit entirely, which is how the 2026-08-25 jsonnet compile grew a 2GB+
 // footprint with the cap nominally in place.
+//
+// [T-ish-footprint-brake] Two admission regimes share this single choke
+// point. In footprint mode the decision comes from ish_mem_commit_ok()
+// (live jetsam headroom) and the counter is accounting only — a plain add,
+// no limit comparison, because the whole point of the redesign is that
+// COMMITMENT is not what kills the app, dirty footprint is. Legacy mode
+// (host never installed a feed: tests, Linux CLI) keeps the ledger check
+// bit-for-bit as before.
 bool anon_pages_reserve(long pages) {
+    if (ish_footprint_mode()) {
+        if (!ish_mem_commit_ok((uint64_t)pages * PAGE_SIZE))
+            return false;
+        atomic_fetch_add(&anon_page_count, pages);
+        anon_pages_precharged(pages);
+        return true;
+    }
     long limit = atomic_load(&anon_page_limit);
     long count = atomic_load(&anon_page_count);
     anon_count_check(count);
@@ -104,6 +184,29 @@ static void anon_count_check(long count) {
 // which is exactly how the 2026-08-24 report was first misread. Rate-limited
 // because a process hitting the ceiling typically retries in a tight loop.
 static void anon_limit_report(const char *where, long requested_pages) {
+    // [T-ish-footprint-brake] In footprint mode the refusal has nothing to do
+    // with the ledger, so the "cap/ceiling" line below would be misinformation
+    // — report the actual reason (brake / stale feed / oversized ask), rate
+    // limited by time since the counter no longer tracks the trigger.
+    if (ish_footprint_mode()) {
+        static _Atomic uint64_t last_ms;
+        uint64_t now = ish_monotonic_ms();
+        uint64_t prev_ms = atomic_load(&last_ms);
+        if (now - prev_ms < 2000)
+            return;
+        atomic_store(&last_ms, now);
+        uint64_t limit = atomic_load(&ish_mem_limit_v);
+        uint64_t avail = atomic_load(&ish_mem_avail_v);
+        bool stale = now - atomic_load(&ish_mem_stamp_ms) > ISH_MEM_STALE_MS;
+        printk("mmap: memory brake refused %s — requested %ld pages, app footprint "
+               "%lu MB / limit %lu MB (avail %lu MB)%s. Failing the guest allocation "
+               "to keep the app below the jetsam line.\n",
+               where, requested_pages,
+               (unsigned long)((limit - avail) >> 20), (unsigned long)(limit >> 20),
+               (unsigned long)(avail >> 20),
+               stale ? " [sampler stale — failing closed]" : "");
+        return;
+    }
     static _Atomic long last_report_pages;
     long count = atomic_load(&anon_page_count);
     long prev = atomic_load(&last_report_pages);

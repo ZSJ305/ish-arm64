@@ -86,6 +86,52 @@ void anon_pages_charge_mapped(long pages);
 void anon_pages_precharged(long pages);
 // Read the parked reservation without consuming it (retry paths).
 long anon_pages_precharge_peek(void);
+
+// [T-ish-footprint-brake] Footprint-based memory governor, stage 1.
+//
+// Once the host starts feeding live memory status through
+// ish_set_memory_status(), the ledger above STOPS being the admission
+// control and becomes accounting only (meminfo, diagnostics, dmesg). The
+// admission decision moves to the number jetsam actually kills on: the
+// app's physical footprint against its live limit.
+//
+// Why: the ledger charges COMMITMENT, jetsam charges DIRTY pages. Node
+// commits 640MB of V8 cage at startup while dirtying a few tens of MB —
+// the ledger refused a workload the device could easily run. Conversely,
+// the ledger cannot see the app's own memory (WebViews, transcripts), so
+// staying under it never guaranteed safety. The footprint feed measures the
+// truth instead of modelling it; the whole class of charge/uncharge
+// asymmetry bugs stops being safety-critical.
+//
+// States: OK admits everything; BRAKE refuses NEW anonymous commitments
+// (mmap/brk ENOMEM, reservation mprotect-commits ENOMEM, lazy fault commits
+// SIGSEGV — the same failure Linux gives when overcommitted memory cannot
+// be backed). Enter BRAKE below 10% headroom, leave above 15% (hysteresis),
+// and a critical memory-pressure event forces it regardless. A stale feed
+// (no update for >2s) also reads as BRAKE: a dead sampler must fail closed.
+//
+// Two things stay admitted even under BRAKE, deliberately:
+//   * the growsdown fault page (a refused stack page corrupts the frame;
+//     callers shrink to 1 page and map it regardless — pre-existing rule);
+//   * COW breaks (the guest already owns that memory; refusing the copy
+//     would SIGSEGV a legitimate write to committed memory. Runaway dirtying
+//     through COW is a stage-2 / guest-OOM-killer concern).
+//
+// Builds whose host never calls the setter (tests, Linux CLI) never enter
+// footprint mode and keep the legacy ledger cap unchanged.
+enum ish_mem_state { ISH_MEM_OK = 0, ISH_MEM_BRAKE = 1 };
+// Host sampler feed. `limit_bytes` = phys_footprint + available (the live
+// jetsam allowance); `avail_bytes` = os_proc_available_memory();
+// `pressure_critical` = the OS sent a critical memory-pressure event.
+void ish_set_memory_status(uint64_t limit_bytes, uint64_t avail_bytes, bool pressure_critical);
+// True once the host feed has been installed (footprint mode active).
+bool ish_footprint_mode(void);
+// Admission check for `bytes` of new anonymous commitment. In legacy mode
+// always true (the ledger check in anon_pages_reserve decides); in
+// footprint mode false when braked, stale, or the single request exceeds
+// the whole limit (an absurd ask deserves a clean upfront ENOMEM rather
+// than a mid-memset death).
+bool ish_mem_commit_ok(uint64_t bytes);
 #endif
 
 // uses mem.lock instead of having a lock of its own
