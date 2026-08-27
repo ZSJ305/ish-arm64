@@ -892,6 +892,38 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
         }
         int old_flags = entry->flags;
         entry->flags = flags | (old_flags & P_META_FLAGS);
+#if ANON_MMAP_LIMIT_PAGES > 0
+        // [T-ish-anon-count-mprotect] mprotect can flip the very predicate the
+        // charge/uncharge pair is keyed on, so the count has to follow it.
+        //
+        // pt_map_nothing charges only when anon_page_is_charged(flags), and
+        // pt_unmap decrements only when it still holds at unmap time. Rewriting
+        // flags here without adjusting the count broke that pairing in BOTH
+        // directions: RW -> PROT_NONE was charged at map and then skipped at
+        // unmap (a permanent leak), and PROT_NONE -> RW was never charged yet
+        // decremented at unmap (the counter goes negative). The negative
+        // direction is demonstrated by case [12] in
+        // regress_anon_count_balance.c.
+        //
+        // That second direction is a plausible contributor to the -1359 MB
+        // count [T-ish-anon-count-negative] added its clamp for — an
+        // unaccounted mprotect is one way to reach a negative count — but this
+        // was not traced back to that incident, so treat the connection as a
+        // hypothesis rather than the established cause. Either way the clamp
+        // remains worth keeping as a backstop.
+        //
+        // Only anonymous pages are counted, and only the charged-state
+        // TRANSITION matters: an RW -> RX change moves no memory and must not
+        // move the count. The reservation branch above `continue`s before
+        // reaching here, so pages it commits via pt_map_nothing are charged
+        // exactly once, by pt_map_nothing.
+        if (old_flags & P_ANONYMOUS) {
+            bool was_charged = anon_page_is_charged(old_flags);
+            bool now_charged = anon_page_is_charged(entry->flags);
+            if (was_charged != now_charged)
+                atomic_fetch_add(&anon_page_count, now_charged ? 1 : -1);
+        }
+#endif
 
         // check if protection is increasing
         if ((flags & ~old_flags) & (P_READ|P_WRITE)) {
@@ -928,7 +960,15 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
         // page yet; it re-marks on its own first compile.
         dst_entry->flags = entry->flags & ~P_CODE;
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (entry->flags & P_ANONYMOUS)
+        // [T-ish-anon-count-cow-predicate] Must mirror pt_unmap's decrement
+        // condition EXACTLY, which is `P_ANONYMOUS && anon_page_is_charged`.
+        // Counting on P_ANONYMOUS alone charged the child for PROT_NONE pages
+        // that pt_unmap then refuses to give back — so every fork of a
+        // PROT_NONE region leaked its full page count, permanently. A single
+        // 128MB V8 cage chunk is 32768 pages, so a handful of forks pinned the
+        // counter above the cap and every later allocation, even 1 page, was
+        // refused while `free -m` showed single-digit MB in use.
+        if ((entry->flags & P_ANONYMOUS) && anon_page_is_charged(entry->flags))
             anon_copied++;
 #endif
     }

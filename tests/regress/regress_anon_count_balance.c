@@ -136,6 +136,39 @@ static void pt_set_flags_commit(long start, long pages, unsigned flags) {
     }
 }
 
+/// [T-ish-anon-count-mprotect] The flag-CHANGE half of pt_set_flags, on pages
+/// that are already present. Rewriting flags moves the very predicate the
+/// charge/uncharge pair keys on, so the count must follow the transition.
+static void pt_set_flags_change(long start, long pages, unsigned flags) {
+    for (long p = start; p < start + pages; p++) {
+        if (!table[p].present) continue;
+        unsigned old_flags = table[p].flags;
+        table[p].flags = flags | (old_flags & P_ANONYMOUS);
+        if (old_flags & P_ANONYMOUS) {
+            bool was = anon_page_is_charged(old_flags);
+            bool now = anon_page_is_charged(table[p].flags);
+            if (was != now)
+                atomic_fetch_add(&anon_page_count, now ? 1 : -1);
+        }
+    }
+    anon_count_check(atomic_load(&anon_page_count));
+}
+
+/// [T-ish-anon-count-cow-predicate] fork(): the child gets its own set of
+/// anonymous pages. The counting predicate MUST match pt_unmap's decrement
+/// predicate, or the child is charged for pages that are never given back.
+static long pt_copy_on_write(long start, long pages, int child_owner) {
+    long anon_copied = 0;
+    for (long p = start; p < start + pages; p++) {
+        if (!table[p].present) continue;
+        if ((table[p].flags & P_ANONYMOUS) && anon_page_is_charged(table[p].flags))
+            anon_copied++;
+    }
+    atomic_fetch_add(&anon_page_count, anon_copied);
+    (void)child_owner;
+    return anon_copied;
+}
+
 // ------------------------------------------------------------------ harness
 
 static int checks, failures;
@@ -143,6 +176,14 @@ static void check(const char *n, bool ok) {
     checks++;
     if (!ok) { failures++; printf("  \033[31mFAIL\033[0m %s\n", n); }
     else printf("  \033[32mok\033[0m   %s\n", n);
+}
+
+/// Counted but not printed — for assertions inside a long loop, where one line
+/// per iteration would bury the result. A failure still lands in the total, and
+/// the loop's own summary check reports the aggregate.
+static void check_silent(bool ok) {
+    checks++;
+    if (!ok) failures++;
 }
 static void reset(void) {
     memset(table, 0, sizeof(table));
@@ -307,6 +348,80 @@ int main(void) {
         atomic_store(&anon_page_count, -5);   // simulate the production bug
         anon_pages_reserve(1);
         check("guard observed the negative count", negative_observations == 1);
+    }
+
+    // [T-ish-anon-count-mprotect] The pairing breaks in BOTH directions when
+    // mprotect rewrites flags without adjusting the count. Each case below
+    // FAILED before the fix: [11] leaked, [12] went negative.
+    printf("\n[11] mprotect RW -> PROT_NONE -> munmap must not leak\n");
+    {
+        reset();
+        pt_map_nothing(0, 64, P_READ | P_WRITE);
+        check("charged while RW", atomic_load(&anon_page_count) == 64);
+        pt_set_flags_change(0, 64, 0);                  // drop to PROT_NONE
+        check("uncharged on losing RW", atomic_load(&anon_page_count) == 0);
+        pt_unmap(0, 64);
+        check("counter back to zero after unmap", atomic_load(&anon_page_count) == 0);
+        check("guard never fired", negative_observations == 0);
+    }
+
+    printf("\n[12] mprotect PROT_NONE -> RW -> munmap must not go negative\n");
+    {
+        reset();
+        pt_map_nothing(0, 64, 0);                       // PROT_NONE: uncharged
+        check("PROT_NONE reservation costs nothing", atomic_load(&anon_page_count) == 0);
+        pt_set_flags_change(0, 64, P_READ | P_WRITE);   // commit it
+        check("charged on gaining RW", atomic_load(&anon_page_count) == 64);
+        pt_unmap(0, 64);
+        check("counter back to zero after unmap", atomic_load(&anon_page_count) == 0);
+        check("guard never fired (no negative dip)", negative_observations == 0);
+    }
+
+    printf("\n[13] a protection change that moves no memory must move no count\n");
+    {
+        reset();
+        pt_map_nothing(0, 32, P_READ | P_WRITE);
+        long before = atomic_load(&anon_page_count);
+        pt_set_flags_change(0, 32, P_READ | P_EXEC);    // RW -> RX: still charged
+        check("RW -> RX leaves the count alone", atomic_load(&anon_page_count) == before);
+        pt_unmap(0, 32);
+        check("counter back to zero", atomic_load(&anon_page_count) == 0);
+    }
+
+    // [T-ish-anon-count-cow-predicate] The production failure: a fork of a
+    // PROT_NONE region charged the child for pages pt_unmap refuses to return.
+    printf("\n[14] fork of a PROT_NONE cage must not leak (the Node bug)\n");
+    {
+        reset();
+        const long cage = 512;                          // stands in for a V8 chunk
+        pt_map_nothing(0, cage, 0);                     // PROT_NONE reservation
+        check("cage costs nothing while reserved", atomic_load(&anon_page_count) == 0);
+        long copied = pt_copy_on_write(0, cage, 2);     // fork
+        check("fork charges nothing for PROT_NONE pages", copied == 0);
+        check("count still zero after fork", atomic_load(&anon_page_count) == 0);
+        pt_unmap(0, cage);                              // child exits
+        check("count still zero after child exit", atomic_load(&anon_page_count) == 0);
+    }
+
+    printf("\n[15] repeated fork/exit cycles must not drift upward\n");
+    {
+        reset();
+        // Mixed region: a PROT_NONE cage plus genuinely committed pages, which
+        // is what a real process image looks like.
+        pt_map_nothing(0, 256, 0);                      // cage
+        pt_map_nothing(256, 64, P_READ | P_WRITE);      // real anonymous memory
+        long baseline = atomic_load(&anon_page_count);
+        check("baseline counts only the committed pages", baseline == 64);
+        for (int i = 0; i < 200; i++) {
+            long copied = pt_copy_on_write(0, 320, 100 + i);   // fork
+            check_silent(copied == 64);                        // only committed pages
+            atomic_fetch_sub(&anon_page_count, copied);        // child exits, returns them
+        }
+        check("200 fork/exit cycles left no drift",
+              atomic_load(&anon_page_count) == baseline);
+        pt_unmap(0, 320);
+        check("counter back to zero", atomic_load(&anon_page_count) == 0);
+        check("guard never fired", negative_observations == 0);
     }
 
     printf("\n%d checks, %d failures\n", checks, failures);
