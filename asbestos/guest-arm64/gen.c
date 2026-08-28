@@ -880,15 +880,28 @@ extern void gadget_fused_subs_reg_bcond_le(void);
 
 static void gen(struct gen_state *state, unsigned long thing) {
     assert(state->size <= state->capacity);
+    // Once the buffer has failed to grow, stop writing. The remaining gadgets
+    // for this instruction are dropped, but the block is discarded wholesale by
+    // fiber_block_compile(), so a half-emitted stream is never executed.
+    if (state->oom)
+        return;
     if (state->size >= state->capacity) {
-        state->capacity *= 2;
+        unsigned new_capacity = state->capacity * 2;
         struct fiber_block *new_block = realloc(state->block,
-                sizeof(*new_block) + state->capacity * sizeof(unsigned long));
+                sizeof(*new_block) + new_capacity * sizeof(unsigned long));
         if (new_block == NULL) {
-            abort();
+            // Aborting here killed the entire app -- every guest thread, plus
+            // the Swift UI side -- because one guest process asked for more
+            // memory than was available. Record the failure instead and let the
+            // compile fail; the run loop raises INT_GPF, which kills only the
+            // guest process that could not be compiled. [T-ish-jit-oom-abort]
+            state->oom = true;
+            return;
         }
+        state->capacity = new_capacity;
         state->block = new_block;
     }
+    assert(state->size < state->capacity);
     state->block->code[state->size++] = thing;
 }
 
@@ -907,6 +920,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     state->ip = addr;
     state->last_insn = 0;
     state->b_follow_depth = 0;
+    state->oom = false;
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }
