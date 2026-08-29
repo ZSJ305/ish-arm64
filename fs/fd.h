@@ -42,6 +42,11 @@ struct fd {
         };
         struct {
             struct poll *poll;
+            // [T-ish-epoll-eintr-spin] How many times in a row poll_wait has
+            // handed back a non-EINTR error that sys_epoll_wait masked as
+            // EINTR. Reset on any successful wait. See kernel/epoll.c for why
+            // an unbounded mask is a livelock.
+            uint32_t converted_errors;
         } epollfd;
         struct {
             uint64_t val;
