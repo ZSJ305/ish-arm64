@@ -8,7 +8,9 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <sys/sysctl.h>   // [T-ish-cli-memory-governor] hw.memsize
 #include "kernel/calls.h"
+#include "kernel/mm.h"    // [T-ish-cli-memory-governor] ish_set_memory_status
 #include "kernel/task.h"
 #include "emu/cpu.h"
 #include "emu/tlb.h"
@@ -311,6 +313,67 @@ void *poll_fn(void *arg) {
     return NULL;
 }
 
+// [T-ish-cli-memory-governor] Host memory feed for the CLI.
+//
+// Mirrors ISHKernel.m's ish_memory_governor_tick: report the process's physical
+// footprint and the remaining allowance, and let the kernel's state machine own
+// the BRAKE/OK decision. Two deliberate differences from iOS:
+//
+//   * there is no jetsam line on macOS, so the "limit" is host physical RAM
+//     rather than footprint + os_proc_available_memory();
+//   * a 250ms dispatch timer would drag libdispatch into a build that does not
+//     otherwise need it, so this is a plain detached pthread on the same
+//     cadence. The kernel's >2s staleness rule still fails closed if it dies.
+static uint64_t ish_cli_phys_footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t) info.phys_footprint;
+}
+
+static uint64_t ish_cli_host_ram(void) {
+    // hw.memsize is the machine's physical RAM; on a CLI host that is the only
+    // honest ceiling available (no per-process allowance exists).
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0)
+        return 0;
+    return bytes;
+}
+
+static void ish_cli_memory_governor_tick(void) {
+    uint64_t ram = ish_cli_host_ram();
+    uint64_t footprint = ish_cli_phys_footprint();
+    if (ram == 0 || footprint == 0)
+        return; // couldn't measure — staleness rule handles a dead feed
+    // Leave a slice of RAM to the rest of the system rather than letting the
+    // guest believe every byte is its own; the guest share matches the 0.8 the
+    // iOS side uses for the same reason.
+    uint64_t limit = (uint64_t)((double)ram * 0.8);
+    uint64_t avail = limit > footprint ? limit - footprint : 0;
+    ish_set_memory_status(limit, avail, false);
+}
+
+static void *ish_cli_memory_governor_thread(void *arg) {
+    (void) arg;
+    for (;;) {
+        ish_cli_memory_governor_tick();
+        usleep(250 * 1000);
+    }
+    return NULL;
+}
+
+static void ish_cli_memory_governor_start(void) {
+    // Prime the feed BEFORE the guest boots. The first allocations happen
+    // during exec of init, long before a 250ms tick would land, and until the
+    // feed exists the kernel is still on the legacy ledger.
+    ish_cli_memory_governor_tick();
+    pthread_t t;
+    if (pthread_create(&t, NULL, ish_cli_memory_governor_thread, NULL) == 0)
+        pthread_detach(t);
+}
+
 int main(int argc, char *const argv[]) {
     ish_signpost_init();
     atexit(dump_pc_hist);
@@ -397,6 +460,28 @@ int main(int argc, char *const argv[]) {
 #ifdef GUEST_ARM64
     p += snprintf(envp + p, sizeof(envp) - p, "PYTHONMALLOC=malloc") + 1;
 #endif
+    // [T-ish-cli-memory-governor] Put the CLI on the same memory governor the
+    // iOS app uses, instead of leaving it on the legacy compile-time ledger.
+    //
+    // mm.h's contract: "Builds whose host never calls the setter (tests, Linux
+    // CLI) never enter footprint mode and keep the legacy ledger cap
+    // unchanged." That ceiling is ANON_MMAP_LIMIT_PAGES = 131072 pages, and the
+    // ledger charges COMMITMENT — every page an mmap reserves, whether or not
+    // it is ever touched. Node commits a multi-hundred-MB V8 cage at startup
+    // while dirtying single-digit MB (measured on device: heapUsed 3.4 MB,
+    // heapTotal 4.6 MB), so it books ~164k pages against a 131k ceiling and
+    // dies with "Fatal process out of memory: NewArray" before running a line
+    // of JS. Four node cases in the 266-package suite fail for exactly this
+    // reason, and they fail on the CLI only — the app installs a real limit and
+    // enters footprint mode, where admission is decided by measured physical
+    // footprint rather than by modelled commitment.
+    //
+    // So feed the same two numbers here. On macOS there is no
+    // os_proc_available_memory(); the equivalent honest pair is the host's
+    // physical RAM as the ceiling and (ceiling - our own footprint) as the
+    // headroom, which is what a CLI process actually has to play with.
+    ish_cli_memory_governor_start();
+
     int err = xX_main_Xx(argc, argv, envp);
     if (err < 0) {
         fprintf(stderr, "xX_main_Xx: %s\n", strerror(-err));
