@@ -287,11 +287,6 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
 
     // TODO this is pretty broken with regards to timeouts
     int res = 0;
-    // [T-ish-poll-ebadf-rebuild] One rebuild attempt per wait, and a bound on
-    // how long an INFINITE wait may spin with nothing ready. See the EBADF
-    // branch and the idle-cap below.
-    bool rebuilt_after_ebadf = false;
-    long idle_spins_after_rebuild = 0;
     while (true) {
         // check if any fds are ready
         struct poll_fd *poll_fd, *tmp;
@@ -404,28 +399,6 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 res = _EINTR;
                 break;
             }
-            // [T-ish-poll-ebadf-rebuild] Bound the post-rebuild idle spin.
-            //
-            // Only counts AFTER an EBADF rebuild, deliberately: an ordinary
-            // infinite wait with nothing ready is the normal state of an idle
-            // shell or a server between connections, and capping that would
-            // break them. But once we have seen a broken registration set, a
-            // wait that still produces nothing is evidence the rebuild did not
-            // fully heal it — and the only alternative on that path is to spin
-            // until the 60s safety valve force-exits the process, which is what
-            // turned a millisecond DNS lookup into a 60s one.
-            //
-            // Hand EINTR to userspace instead. That is a return value every
-            // poll/epoll caller already handles, and it lets the program apply
-            // its OWN policy: musl's resolver retries with its documented DNS
-            // timeout, which is what should have governed this all along.
-            if (rebuilt_after_ebadf && ++idle_spins_after_rebuild >= 3) {
-                printk("poll_wait: no events %lds after an EBADF rebuild (pid=%d) — "
-                       "returning EINTR to userspace instead of spinning to the safety valve\n",
-                       idle_spins_after_rebuild, current->pid);
-                res = _EINTR;
-                break;
-            }
             // Safety valve: if no thread in this process group has
             // done real work for >60s and there are no live child
             // processes, force exit. Catches V8/libuv exit cleanup
@@ -482,44 +455,6 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         }
 
         if (err < 0) {
-            // [T-ish-poll-ebadf-rebuild] EBADF means the registration set has a
-            // dead descriptor in it, not that this wait failed.
-            //
-            // musl's res_msend (the DNS path behind nslookup) fires the A and
-            // AAAA queries together, then closes and recycles sockets as the
-            // answers land. A descriptor closed while it is still registered
-            // leaves a stale entry in the kqueue, and every kevent from then on
-            // reports EBADF for the whole set. The wait is fine; the set is not.
-            //
-            // What used to happen: sys_epoll_wait relabelled EBADF as EINTR,
-            // the guest correctly re-issued epoll_pwait per POSIX, and we came
-            // straight back here with the SAME stale entry still installed. The
-            // second pass no longer errors — it just never sees an event — so it
-            // burns the 1s bounded timeout and `continue`s, sixty times, until
-            // the idle safety valve below force-exits the process. A DNS lookup
-            // that should take milliseconds took a measured 60-61s and returned
-            // rc=0 from do_exit_group(0) rather than from nslookup.
-            //
-            // Rebuild instead. Re-registering every live poll_fd drops whatever
-            // is dead (kevent EV_DELETE on a closed ident is harmless) and
-            // reinstates the rest, so the retry below sees real events on the
-            // very next pass. This is what the error was asking for all along.
-            if (saved_errno == EBADF && !rebuilt_after_ebadf) {
-                rebuilt_after_ebadf = true;   // once per wait — a rebuild that
-                                              // does not help must not loop
-                lock(&poll_->lock);
-                struct poll_fd *rpf;
-                list_for_each_entry(&poll_->poll_fds, rpf, fds) {
-                    if (rpf->fd == NULL || rpf->oneshot_fired)
-                        continue;
-                    real_poll_update(&poll_->real, rpf->fd->real_fd,
-                                     rpf->types, rpf);
-                }
-                if (poll_->notify_pipe[0] != -1)
-                    real_poll_update(&poll_->real, poll_->notify_pipe[0], POLL_READ, NULL);
-                unlock(&poll_->lock);
-                continue;
-            }
             errno = saved_errno;
             res = errno_map();
             break;

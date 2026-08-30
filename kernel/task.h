@@ -91,14 +91,6 @@ struct task {
                                  // equals this, so a stale syscall_restartable
                                  // flag can't corrupt PC on a later interrupt.
     bool syscall_restartable; // this syscall returned EINTR and may restart
-    // [T-ish-epoll-eintr-spin] Set by sys_epoll_wait when the EINTR it is
-    // returning was FABRICATED from a host error rather than caused by a
-    // signal. handle_interrupt consults it so the SA_RESTART rewind does not
-    // re-issue a syscall that is guaranteed to fail again — the livelock that
-    // left `nslookup` children parked in state R with utime frozen at 0 and
-    // immune to `timeout`. Cleared at the same site, so it never outlives the
-    // syscall that set it.
-    bool epoll_eintr_synthetic;
 
     // locked by pids_lock
     dword_t exit_code;

@@ -166,15 +166,7 @@ void handle_interrupt(int interrupt) {
                 // rather than the remaining time, so a `timeout N` wrapper's
                 // sleep would never end. Those keep returning EINTR (userspace
                 // handles their own restart with an adjusted timeout).
-                // [T-ish-epoll-eintr-spin] A synthetic EINTR — one sys_epoll_wait
-                // manufactured from a host kqueue error — must NOT arm the
-                // restart path. Restarting it re-enters a call that fails the
-                // same way every time, so the guest never regains control and a
-                // SIGTERM from `timeout` can never be acted on. Consume the flag
-                // here (it is per-syscall state and must not leak to the next).
-                bool synthetic_eintr = current->epoll_eintr_synthetic;
-                current->epoll_eintr_synthetic = false;
-                if ((int32_t)(uint32_t)result == -EINTR && !synthetic_eintr) {
+                if ((int32_t)(uint32_t)result == -EINTR) {
                     switch (syscall_num) {
                         case 98:  // futex
                         case 22:  // epoll_pwait

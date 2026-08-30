@@ -4,20 +4,6 @@
 
 static struct fd_ops epoll_ops;
 
-/// [T-ish-epoll-eintr-spin] How many consecutive host errors sys_epoll_wait
-/// will mask as EINTR before giving up and returning the real errno.
-///
-/// Sized for "absorb a race, refuse a livelock". The kqueue races this masking
-/// exists for resolve within a wait or two.
-///
-/// [T-ish-poll-ebadf-rebuild] Lowered from 16 to 4 once poll_wait learned to
-/// REBUILD a registration set that reports EBADF. That rebuild is the real fix
-/// for the common case, so this counter went from "the mechanism that ends the
-/// loop" to a pure backstop for some other persistent error nobody has seen
-/// yet — and a backstop should give up early rather than let a guest make
-/// sixteen doomed round-trips first.
-#define EPOLL_MAX_CONVERTED_ERRORS 4
-
 fd_t sys_epoll_create(int_t flags) {
     STRACE("epoll_create(%#x)", flags);
     if (flags & ~(O_CLOEXEC_))
@@ -148,58 +134,8 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
         // as unexpected errnos. libuv asserts that epoll_pwait only fails with
         // EINTR; anything else (EBADF from kqueue race, etc.) crashes the guest.
         // Convert to EINTR so the guest's event loop retries gracefully.
-        //
-        // [T-ish-epoll-eintr-spin] BUT ONLY WHILE THE ERROR LOOKS TRANSIENT.
-        //
-        // "Retries gracefully" holds for a genuine race — the fd is fine a
-        // moment later and the next wait succeeds. It does not hold for a
-        // PERSISTENT error: a poll object whose kqueue fd is really gone
-        // returns the same errno every time, and because we relabel it EINTR
-        // the guest reads it as an ordinary interrupted syscall and comes
-        // straight back in. Nothing ever advances, so the guest spins in a
-        // retry loop that costs it almost no CPU — every iteration fails
-        // immediately inside the kernel. Field signature: `nslookup` children
-        // parked in state R with utime frozen at 0, unkillable by `timeout`,
-        // and dmesg filling with this exact line.
-        //
-        // Bound it. A handful of conversions absorbs the race libuv needs
-        // absorbed; past that the error is structural and the honest answer is
-        // the real errno. libuv will assert and die — which is a diagnosable
-        // failure, unlike a process that hangs forever.
-        epoll->epollfd.converted_errors++;
-        uint32_t seen = epoll->epollfd.converted_errors;
-        if (seen > EPOLL_MAX_CONVERTED_ERRORS) {
-            printk("epoll_wait: error %d persisted %u times, surfacing it (pid=%d)\n",
-                   res, seen, current->pid);
-            return res;
-        }
-        // Rate-limited: this used to print on EVERY conversion, so a spinning
-        // guest buried dmesg — including the evidence needed to diagnose it.
-        // First occurrence plus every 100th keeps the signal and drops the flood.
-        if (seen == 1 || seen % 100 == 0) {
-            printk("epoll_wait: converting error %d to EINTR (pid=%d, count=%u)\n",
-                   res, current->pid, seen);
-        }
+        printk("epoll_wait: converting error %d to EINTR (pid=%d)\n", res, current->pid);
         res = _EINTR;
-        // [T-ish-epoll-eintr-spin] (B) Mark this EINTR as SYNTHETIC so the
-        // SA_RESTART auto-restart path skips it.
-        //
-        // handle_interrupt marks epoll_pwait restartable whenever it returns
-        // EINTR, and receive_signals then rewinds PC to re-issue the syscall.
-        // For a REAL signal that is correct. For this fabricated one it means
-        // the kernel itself re-enters a call guaranteed to fail again — the
-        // guest never gets a chance to react, and the SIGTERM from a `timeout`
-        // wrapper cannot land.
-        //
-        // The flag rather than clearing `syscall_restartable` here: that
-        // assignment happens in handle_interrupt AFTER this function returns
-        // (kernel/calls.c, the `result == -EINTR` switch), so anything set here
-        // would simply be overwritten a moment later.
-        current->epoll_eintr_synthetic = true;
-    } else {
-        // A clean wait (or a real EINTR) means the fd is healthy again; let a
-        // later transient race spend the full budget from scratch.
-        epoll->epollfd.converted_errors = 0;
     }
     return res;
 }
