@@ -8,9 +8,15 @@ static struct fd_ops epoll_ops;
 /// will mask as EINTR before giving up and returning the real errno.
 ///
 /// Sized for "absorb a race, refuse a livelock". The kqueue races this masking
-/// exists for resolve within a wait or two; sixteen is generous for those and
-/// still bounds a broken fd to a few failed round-trips instead of forever.
-#define EPOLL_MAX_CONVERTED_ERRORS 16
+/// exists for resolve within a wait or two.
+///
+/// [T-ish-poll-ebadf-rebuild] Lowered from 16 to 4 once poll_wait learned to
+/// REBUILD a registration set that reports EBADF. That rebuild is the real fix
+/// for the common case, so this counter went from "the mechanism that ends the
+/// loop" to a pure backstop for some other persistent error nobody has seen
+/// yet — and a backstop should give up early rather than let a guest make
+/// sixteen doomed round-trips first.
+#define EPOLL_MAX_CONVERTED_ERRORS 4
 
 fd_t sys_epoll_create(int_t flags) {
     STRACE("epoll_create(%#x)", flags);
