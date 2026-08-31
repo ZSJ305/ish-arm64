@@ -34,20 +34,33 @@ jobs:
                      -configuration Debug-ApplePleaseFixFB19282108 \
                      -sdk iphoneos \
                      -arch arm64 \
+                     -derivedDataPath $PWD/build \
                      CODE_SIGNING_ALLOWED=NO \
                      build
 
       - name: Archive app bundle
         run: |
-          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "iSH ARM64.app" -type d | head -1)
+          APP="$PWD/build/Build/Products/Debug-ApplePleaseFixFB19282108-iphoneos/iSH ARM64.app"
           echo "app bundle: $APP"
-          mkdir -p output
+          if [ ! -d "$APP" ]; then
+            echo "!! 指定路径不存在，尝试搜索 build 目录中的 .app"
+            APP=$(find "$PWD/build" -name "*.app" -type d | head -1)
+            echo "fallback app bundle: $APP"
+          fi
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::找不到 .app 产物"
+            find "$PWD/build" -maxdepth 6 -name "*.app" -type d 2>/dev/null || true
+            exit 1
+          fi
+          rm -rf output Payload
+          mkdir -p output Payload
+          cp -R "$APP" Payload/
           cp -R "$APP" output/
-          # 可选：打成未签名 ipa
-          cd output
-          mkdir -p Payload
-          cp -R "iSH ARM64.app" Payload/
-          zip -r iSH-ARM64.ipa Payload
+          cd Payload && zip -r ../output/iSH-ARM64.ipa . && cd ..
+          echo "=== output 内容 ==="
+          ls -la output/
+          echo "=== ipa 大小 ==="
+          ls -la output/iSH-ARM64.ipa 2>/dev/null || du -sh output/*
 
       - uses: actions/upload-artifact@v4
         with:
@@ -55,4 +68,3 @@ jobs:
           path: |
             output/iSH-ARM64.ipa
             output/iSH ARM64.app
-            iSH.ipa
