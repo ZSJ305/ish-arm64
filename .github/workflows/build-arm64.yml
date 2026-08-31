@@ -1,0 +1,56 @@
+name: Build ARM64 (mac)
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-arm64-ios:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install dependencies (Apple deps)
+        run: |
+          brew install ninja lld llvm libarchive meson
+          bundle install
+
+      # ARM64 target 自带 "Build Meson (ARM64)" phase，会自动编：
+      #   meson setup build-arm64-release -Dguest_arch=arm64 -Dengine=asbestos
+      #   ninja -C build-arm64-release
+      # 所以 xcodebuild 直接触发即可，无需手动 meson。
+      - name: Build ARM64 app (unsigned ipa ready)
+        run: |
+          xcodebuild -project iSH.xcodeproj \
+                     -target iSH-ARM64 \
+                     -configuration DebugLinux \
+                     -sdk iphoneos \
+                     -arch arm64 \
+                     CODE_SIGNING_ALLOWED=NO \
+                     build
+
+      - name: Archive app bundle
+        run: |
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "iSH ARM64.app" -type d | head -1)
+          echo "app bundle: $APP"
+          mkdir -p output
+          cp -R "$APP" output/
+          # 可选：打成未签名 ipa
+          cd output
+          mkdir -p Payload
+          cp -R "iSH ARM64.app" Payload/
+          zip -r iSH-ARM64.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iSH-ARM64-app
+          path: |
+            output/iSH-ARM64.ipa
+            output/iSH ARM64.app
+            iSH.ipa

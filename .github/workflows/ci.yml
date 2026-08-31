@@ -42,6 +42,9 @@ jobs:
     strategy:
       matrix:
         kernel: [ish, linux]
+        arch: [x86, arm64]
+        # x86 分支保持原有语义（x86 guest 默认 target iSH）
+        # arm64 分支用 iSH-ARM64 target（AppARM64.xcconfig 定义 GUEST_ARCH=arm64 + meson arm64 构建）
     steps:
       - uses: actions/checkout@v2
         with:
@@ -53,8 +56,11 @@ jobs:
         if: matrix.kernel == 'linux'
         run: deps/clone-linux.sh
       - name: Build
-        if: matrix.kernel == 'ish'
+        if: matrix.kernel == 'ish' && matrix.arch == 'x86'
         run: xcodebuild -project iSH.xcodeproj -scheme iSH -arch arm64 -sdk iphoneos CODE_SIGNING_ALLOWED=NO
+      - name: Build ARM64 (Apple)
+        if: matrix.kernel == 'ish' && matrix.arch == 'arm64'
+        run: xcodebuild -project iSH.xcodeproj -target iSH-ARM64 -configuration DebugLinux -sdk iphoneos -arch arm64 CODE_SIGNING_ALLOWED=NO
       - name: Build
         if: matrix.kernel == 'linux'
         run: xcodebuild -project iSH.xcodeproj -scheme iSH+Linux -arch x86_64 -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO
