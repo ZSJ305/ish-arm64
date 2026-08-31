@@ -11,6 +11,8 @@ jobs:
   build-arm64-ios:
     runs-on: macos-15
     timeout-minutes: 120
+    permissions:
+      contents: write      # gh release create 需要创建/删除 tag 和 release 的权限
     steps:
       - uses: actions/checkout@v4
         with:
