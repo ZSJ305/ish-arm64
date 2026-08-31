@@ -30,7 +30,7 @@ jobs:
       - name: Build ARM64 app (unsigned ipa ready)
         run: |
           xcodebuild -project iSH.xcodeproj \
-                     -target iSH-ARM64 \
+                     -scheme iSH-ARM64 \
                      -configuration Debug-ApplePleaseFixFB19282108 \
                      -sdk iphoneos \
                      -arch arm64 \
