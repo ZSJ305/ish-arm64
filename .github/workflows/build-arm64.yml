@@ -25,11 +25,13 @@ jobs:
       #   meson setup build-arm64-release -Dguest_arch=arm64 -Dengine=asbestos
       #   ninja -C build-arm64-release
       # 所以 xcodebuild 直接触发即可，无需手动 meson。
+      # 注意：必须用 Debug-ApplePleaseFixFB19282108（=NotLinux/kernel=ish，编 libish.a 等 ARM64 引擎库），
+      #       不能用 DebugLinux（=Linux.xcconfig，会把 ISH_KERNEL 设为 linux，需要 clone+build Linux 内核，CI 无法跑）。
       - name: Build ARM64 app (unsigned ipa ready)
         run: |
           xcodebuild -project iSH.xcodeproj \
                      -target iSH-ARM64 \
-                     -configuration DebugLinux \
+                     -configuration Debug-ApplePleaseFixFB19282108 \
                      -sdk iphoneos \
                      -arch arm64 \
                      CODE_SIGNING_ALLOWED=NO \
