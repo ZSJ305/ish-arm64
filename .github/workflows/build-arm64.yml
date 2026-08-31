@@ -89,7 +89,6 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "iSH ARM64 build #${GITHUB_RUN_NUMBER}" \
             --notes "未签名构建（Debug-ApplePleaseFixFB19282108 / kernel=ish）。需用 Apple ID 签名后装 iPad。构建时间: $(date -u)" \
-            "output/iSH-ARM64.ipa" \
-            "output/iSH ARM64.app"
+            "output/iSH-ARM64.ipa"
           echo "::notice::已发布 $TAG"
           echo "::notice::https://github.com/${{ github.repository }}/releases/tag/$TAG"
